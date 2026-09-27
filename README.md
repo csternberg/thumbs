@@ -69,8 +69,9 @@ Pick one style — `-i` and `-n` replace the timestamp-based options below them:
 | Switch | Meaning |
 |---|---|
 | `--short` | also process videos under 10 seconds (skipped by default) |
+| `--log` | write `thumbs.log` (one line per thumbnail/skip); off by default |
 | `-h` | show help and exit |
-| `-v` | show version and exit |
+| `-v` / `-V` | show version and exit |
 
 ## Examples
 
@@ -90,10 +91,18 @@ python thumbs.py -n 8 -x 320 -o out -k
 
 ## Logs
 
-Each run truncates and rewrites two files in the current directory:
+Neither log file is created unless it's needed:
 
-- `thumbs.log` — one line per extracted thumbnail (and skipped short videos)
-- `thumbs-error.log` — failures, with the last `ffmpeg`/`ffprobe` error output
+- `thumbs.log` — one line per extracted thumbnail (and skipped short videos);
+  only written when `--log` is passed, and truncated fresh each such run.
+- `thumbs-error.log` — failures, with the last `ffmpeg`/`ffprobe` error
+  output; written automatically whenever something actually fails, and any
+  stale copy from a previous run is removed at the start of every run
+  regardless of `--log`. Its absence after a run means nothing failed.
+
+Unexpected per-video errors (a crash in the script itself, not just an
+`ffmpeg` failure) are also caught and logged to `thumbs-error.log` rather
+than aborting the whole batch.
 
 ## Requirements
 

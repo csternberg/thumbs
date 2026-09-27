@@ -50,7 +50,23 @@ Everything lives in `thumbs.py`, top to bottom in execution order:
   other's output.
 - Don't print non-ASCII characters (e.g. a checkmark) to stdout in `main()`
   — this is a Windows-first tool and the default `cp1252` console encoding
-  will crash on a completed run.
+  will crash on a completed run. `main()` also calls
+  `sys.stdout.reconfigure(errors="replace")` up front and `extract()` uses
+  `safe_print()` instead of `print()` for anything that echoes a filename,
+  since video filenames themselves can contain characters outside the
+  console's code page.
+- `process()` is a thin try/except wrapper around `_process()`. Keep new
+  per-video logic in `_process()` (or something it calls) rather than
+  adding it directly to `process()` — a `ThreadPoolExecutor` submit()
+  silently drops exceptions unless something calls `future.result()`, so
+  without that wrapper an unexpected bug would drop a video with zero
+  trace instead of landing in `thumbs-error.log`.
+- `log()` (the `thumbs.log` writer) is gated behind the module-level
+  `LOGGING_ENABLED` flag, set from `--log` in `main()`. `thumbs.log` should
+  never be created unless `--log` was passed. `log_err()` has no such gate
+  — `thumbs-error.log` is meant to always appear when something fails,
+  with no switch needed — but `reset_err_log()` removes any stale copy at
+  the start of every run so its presence always reflects the latest run.
 
 ## Testing changes
 

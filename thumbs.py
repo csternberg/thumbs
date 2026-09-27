@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # thumbs.py - Video thumbnail extractor
-# Version: 4.0
+# Version: 4.1
 
 import os
 import sys
 import argparse
 import subprocess
 import threading
+import traceback
 from pathlib import Path
 import signal
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
 
-VERSION = "4.0"
+VERSION = "4.1"
 
 DEFAULT_TIMESTAMP = 2.0
 STOP = False
-MAX_WORKERS = max(1, min(4, multiprocessing.cpu_count()))
+MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 LOG_FILE = "thumbs.log"
 ERR_FILE = "thumbs-error.log"
@@ -28,13 +28,22 @@ SCAN_ROOT = None  # stable root for -k
 _fs_lock = threading.Lock()
 _claimed_paths = set()
 
+# Set from --log in main(). thumbs.log is only written when this is on;
+# thumbs-error.log is always written, but only once an error actually
+# happens (see reset_err_log()).
+LOGGING_ENABLED = False
 
-def init_logs():
-    open(LOG_FILE, "w").close()
-    open(ERR_FILE, "w").close()
+
+def reset_err_log():
+    try:
+        os.remove(ERR_FILE)
+    except OSError:
+        pass
 
 
 def log(msg):
+    if not LOGGING_ENABLED:
+        return
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
 
@@ -42,6 +51,17 @@ def log(msg):
 def log_err(msg):
     with open(ERR_FILE, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
+
+
+def safe_print(msg):
+    # A video filename can contain characters the console's active code
+    # page can't encode (e.g. a non-Latin-1 name on a default Windows
+    # cp1252 console); fall back instead of crashing the whole run.
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "utf-8"
+        print(msg.encode(enc, errors="replace").decode(enc))
 
 
 # ------------------------------------------------------------
@@ -125,7 +145,11 @@ def hwaccels():
 # FFmpeg runner
 # ------------------------------------------------------------
 def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        # e.g. ffmpeg/ffprobe not installed or not on PATH
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
 
 
 # ------------------------------------------------------------
@@ -259,7 +283,7 @@ def extract(video, t, args, od, kind="custom"):
             ok, err = ffmpeg_attempt(video, out, t, args, mode, hw)
             if ok:
                 msg = f"[+] {out}"
-                print(msg)
+                safe_print(msg)
                 log(msg)
                 return
             last_err = err
@@ -276,6 +300,9 @@ def clamp_timestamp(t, dur):
 
 
 def interval(video, dur, step, args, od):
+    if step <= 0:
+        log_err(f"[SKIP bad -i {step}] {video}")
+        return
     t = 0.0
     while t <= dur:
         extract(video, t, args, od)
@@ -283,6 +310,9 @@ def interval(video, dur, step, args, od):
 
 
 def nframes(video, dur, n, args, od):
+    if n <= 0:
+        log_err(f"[SKIP bad -n {n}] {video}")
+        return
     step = dur / (n + 1)
     for i in range(1, n + 1):
         extract(video, i * step, args, od)
@@ -292,6 +322,18 @@ def nframes(video, dur, n, args, od):
 # PROCESS
 # ------------------------------------------------------------
 def process(video, args):
+    try:
+        _process(video, args)
+    except Exception:
+        # A ThreadPoolExecutor swallows exceptions from submitted tasks
+        # unless something calls future.result(); without this, an
+        # unexpected bug here would silently drop the video with no
+        # trace instead of surfacing in the error log.
+        log_err(f"[ERROR] {video}")
+        log_err(traceback.format_exc())
+
+
+def _process(video, args):
     global STOP
     if STOP:
         return
@@ -308,11 +350,11 @@ def process(video, args):
 
     od = outdir(video, args)
 
-    if args.interval:
+    if args.interval is not None:
         interval(video, dur, args.interval, args, od)
         return
 
-    if args.nframes:
+    if args.nframes is not None:
         nframes(video, dur, args.nframes, args, od)
         return
 
@@ -346,17 +388,21 @@ def scan(folder, args, recursive):
 
     vids = []
 
-    if recursive:
-        for r, _, files in os.walk(folder):
-            for name in files:
-                p = Path(r) / name
-                if is_video(p):
+    try:
+        if recursive:
+            for r, _, files in os.walk(folder):
+                for name in files:
+                    p = Path(r) / name
+                    if is_video(p):
+                        vids.append(p)
+        else:
+            for name in os.listdir(folder):
+                p = Path(folder) / name
+                if p.is_file() and is_video(p):
                     vids.append(p)
-    else:
-        for name in os.listdir(folder):
-            p = Path(folder) / name
-            if p.is_file() and is_video(p):
-                vids.append(p)
+    except OSError as e:
+        print(f"[!] could not scan {folder}: {e}", file=sys.stderr)
+        return
 
     print(f"[+] {len(vids)} videos")
 
@@ -437,6 +483,7 @@ def parse_args():
     p.add_argument("-v", action="store_true")
 
     p.add_argument("--short", action="store_true")
+    p.add_argument("--log", action="store_true")
 
     return p.parse_args(normalize(sys.argv[1:]))
 
@@ -485,8 +532,11 @@ IMAGE
 
 MISC
   --short       also process videos under 10 seconds (skipped by default)
+  --log         write thumbs.log (one line per thumbnail/skip); off by default
   -h            show this help and exit
-  -v            show version and exit
+  -v / -V       show version and exit
+
+thumbs-error.log is only written if something actually fails.
 """)
 
 
@@ -494,6 +544,14 @@ MISC
 # MAIN
 # ------------------------------------------------------------
 def main():
+    # A video filename outside the console's code page would otherwise
+    # crash any plain print() of it (e.g. default cp1252 on Windows).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     argv = sys.argv[1:]
 
     if any(a.lower() in ("-h", "--help") for a in argv):
@@ -506,7 +564,19 @@ def main():
         print(VERSION)
         return
 
-    init_logs()
+    if args.interval is not None and args.interval <= 0:
+        print("[!] -i must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    if args.nframes is not None and args.nframes <= 0:
+        print("[!] -n must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+
+    global LOGGING_ENABLED
+    LOGGING_ENABLED = args.log
+    if LOGGING_ENABLED:
+        open(LOG_FILE, "w").close()
+    reset_err_log()
+
     scan(Path("."), args, recursive=not args.c)
     print("[done]")
 
